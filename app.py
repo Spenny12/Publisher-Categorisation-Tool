@@ -66,7 +66,7 @@ if uploaded_file and client:
     df = pd.read_csv(uploaded_file)
     url_col = st.selectbox("Select URL Column", df.columns)
     
-    if st.button("Start Categorization"):
+    if st.button("Start Categorisation"):
         urls = df[url_col].tolist()
         final_results = []
         progress = st.progress(0)
