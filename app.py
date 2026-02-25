@@ -83,7 +83,7 @@ categories = [c.strip() for c in cat_text.split('\n') if c.strip()] + ["None"]
 
 uploaded_file = st.file_uploader("Upload Publisher CSV", type="csv")
 
-if st.button("Analyse with Client Context") and uploaded_file and api_key:
+if st.button("Run") and uploaded_file and api_key:
     # Step 1: Get Context
     context = get_client_context(client_url)
     st.info("Client context successfully extracted.")
