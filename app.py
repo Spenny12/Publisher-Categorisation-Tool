@@ -37,20 +37,23 @@ def get_client_context(url):
         return combined[:4000] # Token safety
     return "No site context found."
 
-# --- Gemini Processing ---
 def classify_urls(url_batch, allowed_cats, context):
     client = genai.Client(api_key=api_key)
 
-    # Define the structure using Pydantic
+    # 1. Define the structure for a single URL
     class URLCategory(BaseModel):
         url: str
         category: str
         is_relevant: bool
 
-    # Pass the list type directly to the config
+    # 2. Wrap the list in a parent Pydantic object (The Fix)
+    class URLResponse(BaseModel):
+        results: list[URLCategory]
+
+    # Pass the parent object to the config
     config = types.GenerateContentConfig(
         response_mime_type="application/json",
-        response_schema=list[URLCategory],
+        response_schema=URLResponse,
     )
 
     prompt = f"""
@@ -64,13 +67,13 @@ def classify_urls(url_batch, allowed_cats, context):
     """ + "\n".join(url_batch)
 
     response = client.models.generate_content(
-        model='gemini-3.1-flash-lite', # Fastest model for classification
+        model='gemini-3.1-flash-lite',
         contents=prompt,
         config=config
     )
 
-    # Convert Pydantic objects back to dicts for Pandas
-    return [item.model_dump() for item in response.parsed]
+    # 3. Access the 'results' list from the parsed response
+    return [item.model_dump() for item in response.parsed.results]
 
 # --- UI and Execution ---
 cat_input = st.text_area("Categories (One per line):", value="News\nBlog\nE-commerce\nReview Site")
