@@ -4,6 +4,7 @@ from google import genai
 from google.genai import types
 import advertools as adv
 import os
+from pydantic import BaseModel
 
 # --- Page Setup ---
 st.set_page_config(page_title="Gemini URL Pro", layout="wide")
@@ -15,6 +16,8 @@ with st.sidebar:
     batch_size = st.slider("URLs per Batch", 10, 100, 50)
 
 # --- Advertools Client Site Crawler ---
+# Added st.cache_data to prevent Twisted Reactor crashes on rerun
+@st.cache_data(show_spinner=False)
 def get_client_context(url):
     """Crawl homepage + 1 depth for context."""
     output_file = "client_info.jsonl"
@@ -38,21 +41,16 @@ def get_client_context(url):
 def classify_urls(url_batch, allowed_cats, context):
     client = genai.Client(api_key=api_key)
 
-    # Strictly boolean and Enum-constrained schema
+    # Define the structure using Pydantic
+    class URLCategory(BaseModel):
+        url: str
+        category: str
+        is_relevant: bool
+
+    # Pass the list type directly to the config
     config = types.GenerateContentConfig(
         response_mime_type="application/json",
-        response_schema={
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string"},
-                    "category": {"type": "string", "enum": allowed_cats},
-                    "is_relevant": {"type": "boolean"}
-                },
-                "required": ["url", "category", "is_relevant"]
-            }
-        }
+        response_schema=list[URLCategory],
     )
 
     prompt = f"""
@@ -70,7 +68,9 @@ def classify_urls(url_batch, allowed_cats, context):
         contents=prompt,
         config=config
     )
-    return response.parsed
+
+    # Convert Pydantic objects back to dicts for Pandas
+    return [item.model_dump() for item in response.parsed]
 
 # --- UI and Execution ---
 cat_input = st.text_area("Categories (One per line):", value="News\nBlog\nE-commerce\nReview Site")
@@ -102,4 +102,4 @@ if uploaded_file and api_key and client_site:
         st.dataframe(res_df, use_container_width=True)
 
         csv = res_df.to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Download Results", data=csv, file_name="categorized_urls.csv")
+        st.download_button("Download Results", data=csv, file_name="categorized_urls.csv")
