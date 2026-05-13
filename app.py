@@ -66,7 +66,7 @@ def classify_urls(url_batch, allowed_cats, context):
     """ + "\n".join(url_batch)
 
     response = client.models.generate_content(
-        model='gemini-3-flash-preview', # Fastest model for classification
+        model='gemini-3.1-flash-lite', # Fastest model for classification
         contents=prompt,
         config=config
     )
