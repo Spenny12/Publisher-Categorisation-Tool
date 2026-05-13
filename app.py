@@ -4,7 +4,7 @@ from google import genai
 from google.genai import types
 import advertools as adv
 import os
-from pydantic import BaseModel
+import json
 
 # --- Page Setup ---
 st.set_page_config(page_title="Gemini URL Pro", layout="wide")
@@ -16,7 +16,6 @@ with st.sidebar:
     batch_size = st.slider("URLs per Batch", 10, 100, 50)
 
 # --- Advertools Client Site Crawler ---
-# Added st.cache_data to prevent Twisted Reactor crashes on rerun
 @st.cache_data(show_spinner=False)
 def get_client_context(url):
     """Crawl homepage + 1 depth for context."""
@@ -37,23 +36,14 @@ def get_client_context(url):
         return combined[:4000] # Token safety
     return "No site context found."
 
+# --- Gemini Processing ---
 def classify_urls(url_batch, allowed_cats, context):
     client = genai.Client(api_key=api_key)
 
-    # 1. Define the structure for a single URL
-    class URLCategory(BaseModel):
-        url: str
-        category: str
-        is_relevant: bool
-
-    # 2. Wrap the list in a parent Pydantic object (The Fix)
-    class URLResponse(BaseModel):
-        results: list[URLCategory]
-
-    # Pass the parent object to the config
+    # Bypass strict schema enforcement to prevent 500 Server Errors
     config = types.GenerateContentConfig(
         response_mime_type="application/json",
-        response_schema=URLResponse,
+        temperature=0.1 # Low temperature helps ensure JSON stability
     )
 
     prompt = f"""
@@ -62,6 +52,14 @@ def classify_urls(url_batch, allowed_cats, context):
     TASK:
     1. Categorize these URLs using ONLY these categories: {allowed_cats}.
     2. Determine if each URL is topically relevant to the Client Context above (True/False).
+
+    CRITICAL INSTRUCTION:
+    You MUST return ONLY a valid JSON array of objects. Do not use markdown formatting.
+    Format exactly like this:
+    [
+      {{"url": "https://example.com/1", "category": "News", "is_relevant": true}},
+      {{"url": "https://example.com/2", "category": "Blog", "is_relevant": false}}
+    ]
 
     URLs:
     """ + "\n".join(url_batch)
@@ -72,8 +70,21 @@ def classify_urls(url_batch, allowed_cats, context):
         config=config
     )
 
-    # 3. Access the 'results' list from the parsed response
-    return [item.model_dump() for item in response.parsed.results]
+    # Safely parse the raw text back into a list of dicts
+    raw_text = response.text.strip()
+
+    # Failsafe for markdown blocks that occasionally sneak through
+    if raw_text.startswith("```json"):
+        raw_text = raw_text[7:-3].strip()
+    elif raw_text.startswith("```"):
+        raw_text = raw_text[3:-3].strip()
+
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        # Fallback if the model completely fails to return valid JSON for a batch
+        st.error("Model returned invalid JSON for a batch. Skipping.")
+        return []
 
 # --- UI and Execution ---
 cat_input = st.text_area("Categories (One per line):", value="News\nBlog\nE-commerce\nReview Site")
@@ -100,9 +111,12 @@ if uploaded_file and api_key and client_site:
             progress.progress(min((i + batch_size) / len(urls), 1.0))
 
         # Display and Download
-        res_df = pd.DataFrame(results)
-        st.subheader("Results")
-        st.dataframe(res_df, use_container_width=True)
+        if results:
+            res_df = pd.DataFrame(results)
+            st.subheader("Results")
+            st.dataframe(res_df, use_container_width=True)
 
-        csv = res_df.to_csv(index=False).encode('utf-8')
-        st.download_button("Download Results", data=csv, file_name="categorized_urls.csv")
+            csv = res_df.to_csv(index=False).encode('utf-8')
+            st.download_button("📥 Download Results", data=csv, file_name="categorized_urls.csv")
+        else:
+            st.warning("No valid results were returned.")
