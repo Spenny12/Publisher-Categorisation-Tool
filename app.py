@@ -8,6 +8,13 @@ import json
 import urllib.parse
 import google.generativeai as genai
 
+def ensure_scheme(url):
+    """Ensures the URL has an http or https scheme."""
+    url = str(url).strip()
+    if not url.startswith(('http://', 'https://')):
+        return 'https://' + url
+    return url
+
 st.set_page_config(page_title="Publisher Relevance and Categorisation Tool", layout="wide")
 
 def run_isolated_crawl(urls, output_filepath):
@@ -152,7 +159,12 @@ if st.button("Analyse Publishers"):
         if not url_col:
             url_col = df_uploaded.columns[0]
 
-        publisher_urls = df_uploaded[url_col].dropna().astype(str).tolist()
+        # APPLIED FIX: Sanitise the publisher URLs
+        raw_urls = df_uploaded[url_col].dropna().astype(str).tolist()
+        publisher_urls = [ensure_scheme(url) for url in raw_urls]
+
+        # APPLIED FIX: Sanitise the client URL just in case
+        client_url_clean = ensure_scheme(client_url)
 
         st.write("**Status:** Commencing crawl of client website...")
 
@@ -160,9 +172,9 @@ if st.button("Analyse Publishers"):
             client_jl = os.path.join(tmpdirname, 'client.jl')
             pub_jl = os.path.join(tmpdirname, 'publishers.jl')
 
-            # Crawl client
-            run_isolated_crawl([client_url], client_jl)
-            client_summary = extract_domain_summaries(client_jl, [client_url]).get(client_url, "")
+            # Crawl client (using the cleaned URL)
+            run_isolated_crawl([client_url_clean], client_jl)
+            client_summary = extract_domain_summaries(client_jl, [client_url_clean]).get(client_url_clean, "")
 
             st.write("**Status:** Commencing crawl of publisher websites (this may take a moment)...")
 
