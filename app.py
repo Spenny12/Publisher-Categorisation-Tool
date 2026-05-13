@@ -1,12 +1,12 @@
 import streamlit as st
 import pandas as pd
-import tempfile
-import subprocess
-import sys
-import os
-import json
+import requests
+from bs4 import BeautifulSoup
 import urllib.parse
+import json
 import google.generativeai as genai
+
+st.set_page_config(page_title="Publisher Relevance and Categorisation Tool", layout="wide")
 
 def ensure_scheme(url):
     """Ensures the URL has an http or https scheme."""
@@ -15,71 +15,79 @@ def ensure_scheme(url):
         return 'https://' + url
     return url
 
-st.set_page_config(page_title="Publisher Relevance and Categorisation Tool", layout="wide")
+def get_page_data(url):
+    """Fetches a single page and returns its title, meta description, and parsed HTML."""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+    }
+    try:
+        response = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
 
-def run_isolated_crawl(urls, output_filepath):
-    """
-    Runs advertools in a subprocess to prevent Twisted reactor restart errors
-    common in Streamlit applications. DEPTH_LIMIT is set to 1 to crawl the
-    provided URL and one link down.
-    """
-    script_content = f"""
-import advertools as adv
-urls = {urls}
-settings = {{
-    'DEPTH_LIMIT': 1,
-    'CLOSESPIDER_PAGECOUNT': 50,
-    'LOG_LEVEL': 'ERROR',
-    'USER_AGENT': 'CategorisationBot/1.0'
-}}
-adv.crawl(urls, '{output_filepath}', custom_settings=settings)
-    """
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as script_file:
-        script_file.write(script_content)
-        script_path = script_file.name
+        title = soup.title.string.strip() if soup.title and soup.title.string else ""
 
-    subprocess.run([sys.executable, script_path], check=True)
-    os.remove(script_path)
+        meta_desc = ""
+        meta_tag = soup.find('meta', attrs={'name': 'description'}) or soup.find('meta', attrs={'property': 'og:description'})
+        if meta_tag and 'content' in meta_tag.attrs:
+            meta_desc = meta_tag['content'].strip()
 
-def get_domain(url):
-    """Extracts the network location (domain) from a URL."""
-    parsed = urllib.parse.urlparse(str(url))
-    return parsed.netloc if parsed.netloc else str(url)
+        return {"title": title, "meta_desc": meta_desc, "soup": soup}
+    except requests.exceptions.RequestException:
+        return None
 
-def extract_domain_summaries(jl_filepath, original_urls):
-    """Parses the JSONlines output from advertools and concatenates metadata for the LLM."""
-    if not os.path.exists(jl_filepath) or os.path.getsize(jl_filepath) == 0:
-        return {url: "No data retrieved." for url in original_urls}
+def extract_internal_links(soup, base_url, limit=5):
+    """Extracts a limited number of internal links from the parsed HTML."""
+    internal_links = set()
+    base_domain = urllib.parse.urlparse(base_url).netloc
 
-    df = pd.read_json(jl_filepath, lines=True)
-    summaries = {}
+    for a_tag in soup.find_all('a', href=True):
+        if len(internal_links) >= limit:
+            break
 
-    for col in ['url', 'title', 'meta_desc']:
-        if col not in df.columns:
-            df[col] = ''
+        href = a_tag['href']
+        full_url = urllib.parse.urljoin(base_url, href)
+        parsed_url = urllib.parse.urlparse(full_url)
 
-    df['title'] = df['title'].fillna('')
-    df['meta_desc'] = df['meta_desc'].fillna('')
-    df['domain'] = df['url'].apply(get_domain)
+        # Keep only HTTP/HTTPS, matching domain, and remove anchor tags
+        if parsed_url.scheme in ['http', 'https'] and parsed_url.netloc == base_domain:
+            clean_url = urllib.parse.urlunparse((parsed_url.scheme, parsed_url.netloc, parsed_url.path, '', '', ''))
+            # Avoid crawling the homepage again or obvious media files
+            if clean_url != base_url and not clean_url.endswith(('.png', '.jpg', '.pdf', '.mp4')):
+                internal_links.add(clean_url)
 
-    for url in original_urls:
-        target_domain = get_domain(url)
-        domain_df = df[df['domain'] == target_domain]
+    return list(internal_links)
 
-        if domain_df.empty:
-            summaries[url] = "No data retrieved."
-            continue
+def crawl_domain_for_summary(start_url, max_internal_pages=5):
+    """Crawls the homepage and a few internal links to build a text summary for Gemini."""
+    titles = set()
+    metas = set()
 
-        titles = domain_df['title'].replace('', pd.NA).dropna().unique()
-        metas = domain_df['meta_desc'].replace('', pd.NA).dropna().unique()
+    # 1. Fetch Homepage
+    homepage_data = get_page_data(start_url)
 
-        summary_text = "Page Titles:\n" + "\n".join(titles) + "\n\n"
-        summary_text += "Meta Descriptions:\n" + "\n".join(metas)
+    if not homepage_data:
+        return "No data retrieved. Server refused connection or timed out."
 
-        # Truncate to avoid exceeding token limits
-        summaries[url] = summary_text[:4000]
+    if homepage_data["title"]: titles.add(homepage_data["title"])
+    if homepage_data["meta_desc"]: metas.add(homepage_data["meta_desc"])
 
-    return summaries
+    # 2. Extract and fetch internal links (1 link down)
+    internal_links = extract_internal_links(homepage_data["soup"], start_url, limit=max_internal_pages)
+
+    for link in internal_links:
+        page_data = get_page_data(link)
+        if page_data:
+            if page_data["title"]: titles.add(page_data["title"])
+            if page_data["meta_desc"]: metas.add(page_data["meta_desc"])
+
+    # 3. Format the output for the LLM
+    summary_text = "Page Titles Found:\n" + "\n".join(titles) + "\n\n"
+    summary_text += "Meta Descriptions Found:\n" + "\n".join(metas)
+
+    # Truncate to ensure we do not exceed token limits
+    return summary_text[:4000]
 
 def analyse_with_gemini(client_summary, publisher_summary, categories, api_key):
     """Calls Gemini 3.1 Flash Lite to determine relevance and categorise."""
@@ -111,7 +119,6 @@ def analyse_with_gemini(client_summary, publisher_summary, categories, api_key):
         response = model.generate_content(prompt)
         text_response = response.text.strip()
 
-        # Clean formatting if the model returns markdown backticks
         if text_response.startswith('```json'):
             text_response = text_response[7:-3]
         elif text_response.startswith('```'):
@@ -119,13 +126,13 @@ def analyse_with_gemini(client_summary, publisher_summary, categories, api_key):
 
         data = json.loads(text_response.strip())
         return data
-    except Exception as e:
+    except Exception:
         return {"relevant": "Error", "category": "Error"}
 
 # --- User Interface ---
 
 st.title("Publisher Relevance and Categorisation Tool")
-st.write("Upload a CSV of publisher URLs and provide a client website. The programme will crawl one level deep to determine topical relevance and assign categories.")
+st.write("Upload a CSV of publisher URLs and provide a client website. The programme will extract data from the homepage and internal links to determine topical relevance.")
 
 st.markdown("---")
 
@@ -139,6 +146,7 @@ with col1:
 with col2:
     default_categories = "National News\nRegional News\nBlog\nE-commerce\nReview Site"
     categories_input = st.text_area("Categories (one per line)", value=default_categories, height=200)
+    pages_to_crawl = st.slider("Internal pages to crawl per domain", min_value=1, max_value=10, value=3, help="Higher numbers provide more context to the AI but make the tool run slower.")
 
 if st.button("Analyse Publishers"):
     if not api_key or not client_url or not uploaded_file:
@@ -159,56 +167,43 @@ if st.button("Analyse Publishers"):
         if not url_col:
             url_col = df_uploaded.columns[0]
 
-        # APPLIED FIX: Sanitise the publisher URLs
         raw_urls = df_uploaded[url_col].dropna().astype(str).tolist()
         publisher_urls = [ensure_scheme(url) for url in raw_urls]
-
-        # APPLIED FIX: Sanitise the client URL just in case
         client_url_clean = ensure_scheme(client_url)
 
-        st.write("**Status:** Commencing crawl of client website...")
+        st.write("**Status:** Crawling client website...")
+        client_summary = crawl_domain_for_summary(client_url_clean, max_internal_pages=pages_to_crawl)
 
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            client_jl = os.path.join(tmpdirname, 'client.jl')
-            pub_jl = os.path.join(tmpdirname, 'publishers.jl')
+        st.write("**Status:** Commencing publisher analysis...")
 
-            # Crawl client (using the cleaned URL)
-            run_isolated_crawl([client_url_clean], client_jl)
-            client_summary = extract_domain_summaries(client_jl, [client_url_clean]).get(client_url_clean, "")
+        results = []
+        progress_bar = st.progress(0)
+        total_pubs = len(publisher_urls)
 
-            st.write("**Status:** Commencing crawl of publisher websites (this may take a moment)...")
+        for idx, pub_url in enumerate(publisher_urls):
+            # Crawl directly in the loop, no subprocesses needed
+            pub_sum = crawl_domain_for_summary(pub_url, max_internal_pages=pages_to_crawl)
 
-            # Crawl publishers
-            run_isolated_crawl(publisher_urls, pub_jl)
-            pub_summaries = extract_domain_summaries(pub_jl, publisher_urls)
+            # Request LLM analysis
+            res = analyse_with_gemini(client_summary, pub_sum, categories, api_key)
 
-            st.write("**Status:** Crawls complete. Analysing behaviour and relevance via Gemini...")
+            results.append({
+                "Publisher URL": pub_url,
+                "Relevant": res.get("relevant", "Error"),
+                "Category": res.get("category", "Error")
+            })
 
-            results = []
-            progress_bar = st.progress(0)
-            total_pubs = len(publisher_urls)
+            progress_bar.progress((idx + 1) / total_pubs)
 
-            for idx, pub_url in enumerate(publisher_urls):
-                pub_sum = pub_summaries.get(pub_url, "")
-                res = analyse_with_gemini(client_summary, pub_sum, categories, api_key)
+        st.write("**Status:** Analysis complete.")
 
-                results.append({
-                    "Publisher URL": pub_url,
-                    "Relevant": res.get("relevant", "Error"),
-                    "Category": res.get("category", "Error")
-                })
+        df_results = pd.DataFrame(results)
+        st.dataframe(df_results, use_container_width=True)
 
-                progress_bar.progress((idx + 1) / total_pubs)
-
-            st.write("**Status:** Analysis complete.")
-
-            df_results = pd.DataFrame(results)
-            st.dataframe(df_results, use_container_width=True)
-
-            csv_output = df_results.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="Download Results as CSV",
-                data=csv_output,
-                file_name="categorisation_results.csv",
-                mime="text/csv",
-            )
+        csv_output = df_results.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="Download Results as CSV",
+            data=csv_output,
+            file_name="categorisation_results.csv",
+            mime="text/csv",
+        )
