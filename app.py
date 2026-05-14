@@ -4,6 +4,7 @@ import requests
 from bs4 import BeautifulSoup
 import urllib.parse
 import json
+import time
 import google.generativeai as genai
 
 st.set_page_config(page_title="Publisher Relevance and Categorisation Tool", layout="wide")
@@ -22,7 +23,7 @@ def get_page_data(url):
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
     }
     try:
-        response = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
+        response = requests.get(url, headers=headers, timeout=(3, 5), allow_redirects=True)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
 
@@ -178,13 +179,17 @@ if st.button("Analyse Publishers"):
 
         results = []
         progress_bar = st.progress(0)
+
+        # APPLIED FIX: Create an empty container for real-time text updates
+        status_text = st.empty()
+
         total_pubs = len(publisher_urls)
 
         for idx, pub_url in enumerate(publisher_urls):
-            # Crawl directly in the loop, no subprocesses needed
-            pub_sum = crawl_domain_for_summary(pub_url, max_internal_pages=pages_to_crawl)
+            # APPLIED FIX: Update the UI so you know exactly what is happening
+            status_text.markdown(f"**Processing ({idx + 1}/{total_pubs}):** `{pub_url}`")
 
-            # Request LLM analysis
+            pub_sum = crawl_domain_for_summary(pub_url, max_internal_pages=pages_to_crawl)
             res = analyse_with_gemini(client_summary, pub_sum, categories, api_key)
 
             results.append({
@@ -195,7 +200,10 @@ if st.button("Analyse Publishers"):
 
             progress_bar.progress((idx + 1) / total_pubs)
 
-        st.write("**Status:** Analysis complete.")
+            # APPLIED FIX: Pause for 2 seconds to avoid Gemini rate limits
+            time.sleep(2)
+
+        status_text.markdown("**Status:** Analysis complete.")
 
         df_results = pd.DataFrame(results)
         st.dataframe(df_results, use_container_width=True)
